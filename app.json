@@ -23,7 +23,20 @@
       },
       "predictiveBackGestureEnabled": false
     },
-    "plugins": ["expo-notifications"],
-    "runtimeVersion": { "policy": "appVersion" }
+    "plugins": [
+      "expo-notifications"
+    ],
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "9e44e4b9-e4a7-41ba-95a5-04f0598645f1"
+      }
+    },
+    "owner": "arnaud-vs",
+    "updates": {
+      "url": "https://u.expo.dev/9e44e4b9-e4a7-41ba-95a5-04f0598645f1"
+    }
   }
 }

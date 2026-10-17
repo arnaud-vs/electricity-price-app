@@ -1,0 +1,11 @@
+project_id = "electricity-price-app"
+
+# No user accounts, so no JWTs. check-alerts checks its own x-cron-secret header.
+[functions.prices]
+verify_jwt = false
+
+[functions.alerts]
+verify_jwt = false
+
+[functions.check-alerts]
+verify_jwt = false

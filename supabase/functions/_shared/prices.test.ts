@@ -33,8 +33,12 @@ assert.deepEqual(isps, [
   { t: '2026-10-18T11:45:00.000Z', up: null, down: 186, mid: 220.48 },
   { t: '2026-10-18T12:00:00.000Z', up: 228, down: 239.71, mid: 239.54 },
 ])
-// No regulation → mid price; one direction → that price twice; both → shortage up, surplus down.
-assert.deepEqual(isps.map(toPoint).map(x => [x.p, x.p2]), [[218.89, 218.89], [186, 186], [228, 239.71]])
+// No regulation → mid price; one direction → that price twice; both → bounded by the mid price.
+assert.deepEqual(isps.map(toPoint).map(x => [x.p, x.p2]), [[218.89, 218.89], [186, 186], [239.54, 239.54]])
+// Real state-2 quarter-hours of 17 Oct 2026 (20:15 and 21:30) against TenneT's settlement prices.
+const t = isps[0].t
+assert.deepEqual(toPoint({ t, up: 140, down: 142, mid: 208.29 }), { t, p: 208.29, p2: 142 })
+assert.deepEqual(toPoint({ t, up: 210, down: 169.6, mid: 143.18 }), { t, p: 210, p2: 143.18 })
 // A later poll of the same quarter-hour widens it, never narrows it.
 assert.deepEqual(merge(isps[2], { t: isps[2].t, up: 200, down: 150, mid: 240 }), { t: isps[2].t, up: 228, down: 150, mid: 240 })
 console.log('ok')

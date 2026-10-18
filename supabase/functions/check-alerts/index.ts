@@ -2,10 +2,11 @@
 //  - imbalance: once when the latest quarter-hour crosses above/below a device's threshold
 //    (again only after it has returned inside the band, or crossed to the other side)
 //  - day-ahead: once, as soon as tomorrow's prices are published, if any quarter-hour is past a threshold
+// First it stores the latest NL imbalance data (TenneT only serves the last 30 minutes live).
 // Protected by the x-cron-secret header.
 
 import { createClient } from 'npm:@supabase/supabase-js@2'
-import { brusselsDate, brusselsHour, dayAhead, hhmm, imbalance, type Zone, ZONES } from '../_shared/prices.ts'
+import { balanceDelta, brusselsDate, brusselsHour, dayAhead, hhmm, imbalance, type IspRow, merge, type Zone, ZONES } from '../_shared/prices.ts'
 
 type Row = {
   token: string; zone: Zone
@@ -18,9 +19,25 @@ type Msg = { to: string; title: string; body: string; sound: 'default' }
 const eur = (p: number) => `€${Math.round(p)}`
 const NAMES: Record<Zone, string> = { BE: 'Belgium', NL: 'Netherlands' }
 
+// Merge TenneT's last 30 minutes into imbalance_nl (a quarter-hour can span several polls) and drop
+// rows older than 2 days.
+// deno-lint-ignore no-explicit-any
+async function collectNl(db: any) {
+  const fresh = await balanceDelta(Deno.env.get('TENNET_API_KEY')!)
+  if (!fresh.length) return
+  const { data: old, error } = await db.from('imbalance_nl').select('t, up, down, mid').in('t', fresh.map(r => r.t))
+  if (error) throw error
+  const byT = new Map((old as IspRow[]).map(r => [new Date(r.t).toISOString(), r]))
+  const rows = fresh.map(r => (byT.has(r.t) ? merge({ ...byT.get(r.t)!, t: r.t }, r) : r))
+  const up = await db.from('imbalance_nl').upsert(rows)
+  if (up.error) throw up.error
+  await db.from('imbalance_nl').delete().lt('t', new Date(Date.now() - 2 * 864e5).toISOString())
+}
+
 Deno.serve(async (req: Request) => {
   if (req.headers.get('x-cron-secret') !== Deno.env.get('CRON_SECRET')) return new Response('unauthorized', { status: 401 })
   const db = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!)
+  await collectNl(db).catch(e => console.error('NL collect failed', e))
   const { data, error } = await db.from('alerts').select('*')
   if (error) { console.error(error); return new Response('db error', { status: 500 }) }
   const rows = data as Row[]
@@ -35,10 +52,10 @@ Deno.serve(async (req: Request) => {
 
     // Imbalance: latest published quarter-hour of today. In NL regulation state 2 there are two
     // prices; "above" checks the higher one and "below" the lower one.
-    const latest = (await imbalance(brusselsDate(), zone).catch(e => (console.error(e), []))).at(-1)
+    const latest = (await imbalance(brusselsDate(), zone, db).catch(e => (console.error(e), []))).at(-1)
     if (latest) {
       const high = Math.max(latest.p, latest.p2 ?? latest.p), low = Math.min(latest.p, latest.p2 ?? latest.p)
-      const dual = latest.p2 != null ? ` (dual pricing: shortage ${eur(latest.p)}, surplus ${eur(latest.p2)})` : ''
+      const dual = latest.p2 != null && latest.p2 !== latest.p ? ` (dual pricing: shortage ${eur(latest.p)}, surplus ${eur(latest.p2)})` : ''
       for (const r of zrows) {
         const state = r.imb_above != null && high > r.imb_above ? 'above'
           : r.imb_below != null && low < r.imb_below ? 'below' : null

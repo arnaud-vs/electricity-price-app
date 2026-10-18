@@ -1,12 +1,13 @@
 // Day-ahead (ENTSO-E) and imbalance (Elia for BE, TenneT for NL) prices for one calendar day.
-// Every price is { t: ISO UTC start of the quarter-hour, p: €/MWh }. NL imbalance in regulation
-// state 2 has two prices: p is the shortage price, p2 the surplus price.
+// Every price is { t: ISO UTC start of the quarter-hour, p: €/MWh }. NL imbalance also has p2:
+// p is the shortage price, p2 the surplus price (equal except in regulation state 2).
 
 export type Point = { t: string; p: number; p2?: number }
 export type Zone = 'BE' | 'NL'
 export const ZONES: Zone[] = ['BE', 'NL']
 const EIC: Record<Zone, string> = { BE: '10YBE----------2', NL: '10YNL----------L' }
 
+const QH = 15 * 60e3
 const TZ = 'Europe/Brussels' // Amsterdam keeps the same clock, so one timezone covers both zones
 
 // Brussels calendar date (YYYY-MM-DD), plusDays from today.
@@ -43,8 +44,20 @@ export function dayBounds(date: string): [Date, Date] {
 
 // ponytail: ods162 is the live dataset under the current imbalance methodology. Elia switches
 // methodology on 24/11/2026 (preview dataset ods212); check whether ods162 keeps updating then.
-export function imbalance(date: string, zone: Zone): Promise<Point[]> {
-  return zone === 'NL' ? tennet(date) : elia(date)
+// deno-lint-ignore no-explicit-any
+type Db = any // SupabaseClient; kept loose so this file stays free of npm imports for the node test
+
+export function imbalance(date: string, zone: Zone, db: Db): Promise<Point[]> {
+  return zone === 'NL' ? nl(date, db) : elia(date)
+}
+
+async function nl(date: string, db: Db): Promise<Point[]> {
+  const [from, to] = dayBounds(date)
+  const { data, error } = await db.from('imbalance_nl').select('t, up, down, mid')
+    .gte('t', from.toISOString()).lt('t', to.toISOString()).order('t')
+  if (error) throw error
+  return (data as IspRow[]).filter(r => r.up != null || r.down != null || r.mid != null)
+    .map(r => toPoint({ ...r, t: new Date(r.t).toISOString() }))
 }
 
 async function elia(date: string): Promise<Point[]> {
@@ -59,42 +72,40 @@ async function elia(date: string): Promise<Point[]> {
     .map((r: { datetime: string; imbalanceprice: number }) => ({ t: new Date(r.datetime).toISOString(), p: r.imbalanceprice }))
 }
 
-type TennetPoint = { timeInterval_start: string; shortage: string | null; surplus: string | null; regulation_state: number }
+// NL: TenneT settlement prices only arrive the next day (and allow 25 requests a day), so today's
+// prices come from Balance Delta /latest: the last 30 minutes in 12-second steps. check-alerts
+// collects it every 5 minutes into imbalance_nl, one row per quarter-hour.
+export type IspRow = { t: string; up: number | null; down: number | null; mid: number | null }
+type DeltaPoint = { timeInterval_start: string; max_upw_regulation_price: string | null; min_downw_regulation_price: string | null; mid_price: string | null }
 
-async function tennet(date: string): Promise<Point[]> {
-  const [from, to] = dayBounds(date)
-  // The API takes "DD-MM-YYYY HH:MM:SS" without saying which zone, and seems to return at most 200 points.
-  // Previous day 22:00 to next day 00:00 covers the local day whether it reads that as UTC or local
-  // time (at most 104 points); the UTC filter in parseTennet keeps exactly the day.
-  const fmt = (d: string, plusDays: number, time: string) =>
-    new Date(Date.parse(d) + plusDays * 864e5).toISOString().replace(/^(\d+)-(\d+)-(\d+)T.*/, `$3-$2-$1 ${time}`)
-  const res = await fetch('https://api.tennet.eu/publications/v1/settlement-prices'
-    + `?date_from=${encodeURIComponent(fmt(date, -1, '22:00:00'))}&date_to=${encodeURIComponent(fmt(date, 1, '00:00:00'))}`,
-    { headers: { apikey: Deno.env.get('TENNET_API_KEY')!, Accept: 'application/json' } })
-  if (res.status === 404) return [] // "No data found"
+export async function balanceDelta(key: string): Promise<IspRow[]> {
+  const res = await fetch('https://api.tennet.eu/publications/v1/balance-delta-high-res/latest',
+    { headers: { apikey: key, Accept: 'application/json' } })
   if (!res.ok) throw new Error(`TenneT ${res.status}: ${(await res.text()).slice(0, 300)}`)
-  return parseTennet(await res.json(), from, to)
+  return perIsp(await res.json())
 }
 
-// Local wall-clock time without zone ("2026-10-17T22:00") → UTC instant.
-function fromLocal(s: string): number {
-  const guess = Date.parse(s + 'Z')
-  const m = new Intl.DateTimeFormat('en', { timeZone: TZ, timeZoneName: 'longOffset' })
-    .format(guess).match(/GMT([+-])(\d\d):(\d\d)/)
-  return guess - (m ? (m[1] === '-' ? -1 : 1) * (+m[2] * 60 + +m[3]) : 0) * 60e3
+// Per quarter-hour: highest upward price, lowest downward price (null = no regulation that way), last mid price.
+export function perIsp(json: { Response?: { TimeSeries: { Period: { points: DeltaPoint[] }[] }[] } }): IspRow[] {
+  const rows = new Map<number, IspRow>()
+  const num = (s: string | null) => (s == null ? null : +s)
+  for (const x of (json.Response?.TimeSeries ?? []).flatMap(s => s.Period.flatMap(p => p.points))) {
+    const t = Math.floor(Date.parse(x.timeInterval_start) / QH) * QH
+    const r = rows.get(t) ?? { t: new Date(t).toISOString(), up: null, down: null, mid: null }
+    rows.set(t, merge(r, { t: r.t, up: num(x.max_upw_regulation_price), down: num(x.min_downw_regulation_price), mid: num(x.mid_price) }))
+  }
+  return [...rows.values()]
 }
 
-// Settlement prices only cover finished days: for today TenneT answers 200 { error: "No data found" }.
-// Timestamps are Dutch local time without a zone.
-export function parseTennet(json: { error?: string; Response?: { TimeSeries: { Period: { Points: TennetPoint[] } }[] } }, from: Date, to: Date): Point[] {
-  return (json.Response?.TimeSeries ?? []).flatMap(s => s.Period.Points)
-    .map(x => ({ ...x, at: fromLocal(x.timeInterval_start) }))
-    .filter(x => x.shortage != null && x.at >= +from && x.at < +to)
-    .map(x => ({
-      t: new Date(x.at).toISOString(), p: +x.shortage!,
-      ...(x.regulation_state === 2 && x.surplus != null ? { p2: +x.surplus } : {}),
-    }))
-    .sort((a, b) => a.t.localeCompare(b.t))
+const best = (a: number | null, b: number | null, pick: (...n: number[]) => number) => (a == null ? b : b == null ? a : pick(a, b))
+export const merge = (a: IspRow, b: IspRow): IspRow =>
+  ({ t: a.t, up: best(a.up, b.up, Math.max), down: best(a.down, b.down, Math.min), mid: b.mid ?? a.mid })
+
+// Shortage and surplus price of a quarter-hour. They differ only when it saw both upward and
+// downward regulation (regulation state 2); otherwise both are the one price that applied.
+export const toPoint = (r: IspRow): Point => {
+  const p = r.up ?? r.down ?? r.mid!, p2 = r.down ?? r.up ?? r.mid!
+  return { t: r.t, p, p2 }
 }
 
 export async function dayAhead(date: string, zone: Zone, token: string): Promise<Point[]> {

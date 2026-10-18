@@ -4,7 +4,7 @@ import * as Notifications from 'expo-notifications'
 import Storage from 'expo-sqlite/kv-store'
 import { StatusBar } from 'expo-status-bar'
 import { useCallback, useEffect, useState } from 'react'
-import { Alert, AppState, Linking, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native'
+import { Alert, AppState, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native'
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context'
 
 // Supabase edge functions base URL. Public, not a secret.
@@ -18,7 +18,6 @@ type Zone = (typeof ZONES)[number][0]
 // NL imbalance in regulation state 2 has two prices: p is the shortage price, p2 the surplus price.
 type Point = { t: string; p: number; p2?: number }
 type Prices = { from: string; to: string; da: Point[] | null; imb: Point[] | null }
-const FEEDBACK = 'arnaud@gridual.ai'
 const DA = '#2563eb', IMB = '#ea580c', SURPLUS = '#16a34a'
 const FIELDS = [
   ['da_above', 'Day-ahead above'], ['da_below', 'Day-ahead below'],
@@ -55,6 +54,7 @@ function Home() {
   const [fields, setFields] = useState(EMPTY)
   const [saving, setSaving] = useState(false)
   const [idea, setIdea] = useState('')
+  const [sending, setSending] = useState(false)
   const name = ZONES.find(z => z[0] === zone)![1]
 
   const load = useCallback(async () => {
@@ -114,15 +114,19 @@ function Home() {
     }
   }
 
-  // ponytail: opens the Mail app instead of a backend mailer; add an edge function + email API if
-  // people without Mail set up need to send ideas.
   async function sendIdea() {
-    const url = `mailto:${FEEDBACK}?subject=${encodeURIComponent('Power Prices idea')}&body=${encodeURIComponent(idea)}`
+    setSending(true)
     try {
-      await Linking.openURL(url)
+      const res = await fetch(`${API}/ideas`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: idea }),
+      })
+      if (!res.ok) throw new Error(await res.text())
       setIdea('')
+      Alert.alert('Thanks!', 'Your idea was sent.')
     } catch {
-      Alert.alert('No mail app', `Send your idea to ${FEEDBACK}`)
+      Alert.alert('Could not send your idea', 'Check your connection and try again.')
+    } finally {
+      setSending(false)
     }
   }
 
@@ -175,9 +179,10 @@ function Home() {
 
         <Text style={[s.h2, { marginTop: 32 }]}>Ideas box</Text>
         <Text style={s.muted}>Missing a country, a price or a feature? Tell me.</Text>
-        <TextInput style={[s.input, s.idea]} value={idea} onChangeText={setIdea} multiline placeholder="Your idea"
-          accessibilityLabel="Your idea" />
-        <Pressable style={[s.button, !idea.trim() && { opacity: 0.5 }]} onPress={sendIdea} disabled={!idea.trim()} accessibilityRole="button">
+        <TextInput style={[s.input, s.idea]} value={idea} onChangeText={setIdea} multiline maxLength={2000}
+          placeholder="Your idea" accessibilityLabel="Your idea" />
+        <Pressable style={[s.button, (!idea.trim() || sending) && { opacity: 0.5 }]} onPress={sendIdea} disabled={!idea.trim() || sending}
+          accessibilityRole="button">
           <Text style={s.buttonText}>Send idea</Text>
         </Pressable>
       </ScrollView>
@@ -190,12 +195,15 @@ function PriceCard({ prices: { da, imb, from, to } }: { prices: Prices }) {
   const now = Date.now()
   const daNow = da?.find(x => +new Date(x.t) <= now && now < +new Date(x.t) + QH)
   const imbNow = imb?.at(-1)
-  const dual = imb?.filter(x => x.p2 != null).length ?? 0
+  // NL has a surplus price next to the shortage price; they only differ in regulation state 2.
+  const two = imb?.some(x => x.p2 != null)
+  const dual = imb?.filter(x => x.p2 != null && x.p2 !== x.p).length ?? 0
+  const rt2 = imbNow?.p2 != null && imbNow.p2 !== imbNow.p
   const series = [
     da?.length ? { color: DA, label: 'Day-ahead', points: da } : null,
     // Surplus first so the shortage trace covers it wherever the two prices are equal.
-    dual ? { color: SURPLUS, label: 'Imbalance surplus', points: imb!.map(x => ({ t: x.t, p: x.p2 ?? x.p })) } : null,
-    imb?.length ? { color: IMB, label: dual ? 'Imbalance shortage' : 'Imbalance', points: imb } : null,
+    two ? { color: SURPLUS, label: 'Imbalance surplus', points: imb!.map(x => ({ t: x.t, p: x.p2 ?? x.p })) } : null,
+    imb?.length ? { color: IMB, label: two ? 'Imbalance shortage' : 'Imbalance', points: imb } : null,
   ].filter(x => x != null)
   return (
     <View style={s.card}>
@@ -204,12 +212,12 @@ function PriceCard({ prices: { da, imb, from, to } }: { prices: Prices }) {
         <Headline label="Imbalance" color={IMB} value={imbNow?.p} note={imbNow && `at ${hhmm(imbNow.t)}`}
           missing={imb == null ? 'unavailable' : 'none yet'} />
       </View>
-      {imbNow?.p2 != null && (
-        <Text style={s.flag}>Regulation state 2 (dual pricing): shortage €{Math.round(imbNow.p)}, surplus €{Math.round(imbNow.p2)}</Text>
+      {rt2 && (
+        <Text style={s.flag}>Regulation state 2 (dual pricing): shortage €{Math.round(imbNow!.p)}, surplus €{Math.round(imbNow!.p2!)}</Text>
       )}
       {series.length > 0 && <Chart series={series} from={from} to={to} />}
       <Text style={s.muted}>€/MWh per quarter-hour, today</Text>
-      {dual > 0 && imbNow?.p2 == null && <Text style={s.muted}>Dual pricing in {dual} quarter-hour{dual > 1 ? 's' : ''} today</Text>}
+      {dual > 0 && !rt2 && <Text style={s.muted}>Dual pricing in {dual} quarter-hour{dual > 1 ? 's' : ''} today</Text>}
     </View>
   )
 }

@@ -1,6 +1,6 @@
 // Run: node supabase/functions/_shared/prices.test.ts
 import assert from 'node:assert'
-import { dayBounds, parseA44, parseTennet } from './prices.ts'
+import { dayBounds, merge, parseA44, perIsp, toPoint } from './prices.ts'
 
 // Normal, short (spring forward) and long (fall back) Brussels days.
 assert.deepEqual(dayBounds('2026-10-12').map(d => d.toISOString()), ['2026-10-11T22:00:00.000Z', '2026-10-12T22:00:00.000Z'])
@@ -18,21 +18,23 @@ const xml = `<Publication_MarketDocument><TimeSeries><Period>
 const [from, to] = dayBounds('2026-10-12')
 assert.deepEqual(parseA44(xml, from, to).map(x => x.p), [50.5, 50.5, -10, 70])
 assert.deepEqual(parseA44(xml, new Date('2026-10-11T22:30Z'), to).map(x => x.p), [-10, 70])
-// TenneT: second price only in regulation state 2, missing prices and other days dropped, sorted.
-const pt = (t: string, shortage: string | null, surplus: string | null, regulation_state: number) =>
-  ({ timeInterval_start: t, shortage, surplus, regulation_state })
-const tennet = { Response: { TimeSeries: [{ Period: { Points: [
-  pt('2026-10-12T10:15', '120.50', '-30.00', 2),
-  pt('2026-10-12T10:00', '80.00', '80.00', 1),
-  pt('2026-10-12T10:30', null, null, 0),
-  pt('2026-10-13T00:00', '50.00', '50.00', -1), // next local day
-  pt('2026-10-12T00:00', '60.00', '60.00', 0), // local midnight = 22:00 UTC the day before
-
-] } }] } }
-assert.deepEqual(parseTennet({ error: 'No data found' }, from, to), [])
-assert.deepEqual(parseTennet(tennet, from, to), [
-  { t: '2026-10-11T22:00:00.000Z', p: 60 },
-  { t: '2026-10-12T08:00:00.000Z', p: 80 },
-  { t: '2026-10-12T08:15:00.000Z', p: 120.5, p2: -30 },
+// TenneT balance delta: per quarter-hour the highest upward and lowest downward price.
+const dp = (t: string, up: string | null, down: string | null, mid: string) =>
+  ({ timeInterval_start: t, max_upw_regulation_price: up, min_downw_regulation_price: down, mid_price: mid })
+const isps = perIsp({ Response: { TimeSeries: [{ Period: [{ points: [
+  dp('2026-10-18T11:44:36Z', null, null, '218.89'),
+  dp('2026-10-18T11:45:00Z', null, '240.72', '218.89'),
+  dp('2026-10-18T11:48:36Z', null, '186.00', '220.48'),
+  dp('2026-10-18T12:00:36Z', '216.00', '239.71', '239.54'),
+  dp('2026-10-18T12:02:36Z', '228.00', null, '239.54'),
+] }] }] } })
+assert.deepEqual(isps, [
+  { t: '2026-10-18T11:30:00.000Z', up: null, down: null, mid: 218.89 },
+  { t: '2026-10-18T11:45:00.000Z', up: null, down: 186, mid: 220.48 },
+  { t: '2026-10-18T12:00:00.000Z', up: 228, down: 239.71, mid: 239.54 },
 ])
+// No regulation → mid price; one direction → that price twice; both → shortage up, surplus down.
+assert.deepEqual(isps.map(toPoint).map(x => [x.p, x.p2]), [[218.89, 218.89], [186, 186], [228, 239.71]])
+// A later poll of the same quarter-hour widens it, never narrows it.
+assert.deepEqual(merge(isps[2], { t: isps[2].t, up: 200, down: 150, mid: 240 }), { t: isps[2].t, up: 228, down: 150, mid: 240 })
 console.log('ok')

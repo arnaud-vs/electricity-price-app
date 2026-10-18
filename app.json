@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "BE Power Prices",
+    "name": "Power Prices",
     "slug": "electricity-price-app",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -24,7 +24,8 @@
       "predictiveBackGestureEnabled": false
     },
     "plugins": [
-      "expo-notifications"
+      "expo-notifications",
+      "expo-sqlite"
     ],
     "runtimeVersion": {
       "policy": "appVersion"

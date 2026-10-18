@@ -1,10 +1,13 @@
-// Belgian day-ahead (ENTSO-E) and imbalance (Elia) prices for one Brussels calendar day.
-// Every price is { t: ISO UTC start of the quarter-hour, p: €/MWh }.
+// Day-ahead (ENTSO-E) and imbalance (Elia for BE, TenneT for NL) prices for one calendar day.
+// Every price is { t: ISO UTC start of the quarter-hour, p: €/MWh }. NL imbalance in regulation
+// state 2 has two prices: p is the shortage price, p2 the surplus price.
 
-export type Point = { t: string; p: number }
+export type Point = { t: string; p: number; p2?: number }
+export type Zone = 'BE' | 'NL'
+export const ZONES: Zone[] = ['BE', 'NL']
+const EIC: Record<Zone, string> = { BE: '10YBE----------2', NL: '10YNL----------L' }
 
-const TZ = 'Europe/Brussels'
-const BE = '10YBE----------2'
+const TZ = 'Europe/Brussels' // Amsterdam keeps the same clock, so one timezone covers both zones
 
 // Brussels calendar date (YYYY-MM-DD), plusDays from today.
 export function brusselsDate(plusDays = 0): string {
@@ -40,7 +43,11 @@ export function dayBounds(date: string): [Date, Date] {
 
 // ponytail: ods162 is the live dataset under the current imbalance methodology. Elia switches
 // methodology on 24/11/2026 (preview dataset ods212); check whether ods162 keeps updating then.
-export async function imbalance(date: string): Promise<Point[]> {
+export function imbalance(date: string, zone: Zone): Promise<Point[]> {
+  return zone === 'NL' ? tennet(date) : elia(date)
+}
+
+async function elia(date: string): Promise<Point[]> {
   const [from, to] = dayBounds(date)
   const where = `datetime >= '${from.toISOString()}' and datetime < '${to.toISOString()}'`
   const res = await fetch('https://opendata.elia.be/api/explore/v2.1/catalog/datasets/ods162/records'
@@ -52,11 +59,36 @@ export async function imbalance(date: string): Promise<Point[]> {
     .map((r: { datetime: string; imbalanceprice: number }) => ({ t: new Date(r.datetime).toISOString(), p: r.imbalanceprice }))
 }
 
-export async function dayAhead(date: string, token: string): Promise<Point[]> {
+type TennetPoint = { timeInterval_start: string; shortage: string | null; surplus: string | null; regulation_state: number }
+
+async function tennet(date: string): Promise<Point[]> {
   const [from, to] = dayBounds(date)
+  // The API takes "DD-MM-YYYY HH:MM:SS" without a zone; ask a day either side and filter on the UTC timestamps.
+  const fmt = (d: Date) => d.toISOString().replace(/^(\d+)-(\d+)-(\d+)T.*/, '$3-$2-$1 00:00:00')
+  const res = await fetch('https://api.tennet.eu/publications/v1/settlement-prices'
+    + `?date_from=${encodeURIComponent(fmt(new Date(+from - 864e5)))}&date_to=${encodeURIComponent(fmt(new Date(+to + 864e5)))}`,
+    { headers: { apikey: Deno.env.get('TENNET_API_KEY')!, Accept: 'application/json' } })
+  if (res.status === 404) return [] // "No data found"
+  if (!res.ok) throw new Error(`TenneT ${res.status}: ${(await res.text()).slice(0, 300)}`)
+  return parseTennet(await res.json(), from, to)
+}
+
+export function parseTennet(json: { Response: { TimeSeries: { Period: { Points: TennetPoint[] } }[] } }, from: Date, to: Date): Point[] {
+  return json.Response.TimeSeries.flatMap(s => s.Period.Points)
+    .filter(x => x.shortage != null && +new Date(x.timeInterval_start) >= +from && +new Date(x.timeInterval_start) < +to)
+    .map(x => ({
+      t: new Date(x.timeInterval_start).toISOString(), p: +x.shortage!,
+      ...(x.regulation_state === 2 && x.surplus != null ? { p2: +x.surplus } : {}),
+    }))
+    .sort((a, b) => a.t.localeCompare(b.t))
+}
+
+export async function dayAhead(date: string, zone: Zone, token: string): Promise<Point[]> {
+  const [from, to] = dayBounds(date)
+  const eic = EIC[zone]
   const fmt = (d: Date) => d.toISOString().replace(/[-:T]/g, '').slice(0, 12)
   const res = await fetch(`https://web-api.tp.entsoe.eu/api?securityToken=${token}&documentType=A44`
-    + `&in_Domain=${BE}&out_Domain=${BE}&periodStart=${fmt(from)}&periodEnd=${fmt(to)}`)
+    + `&in_Domain=${eic}&out_Domain=${eic}&periodStart=${fmt(from)}&periodEnd=${fmt(to)}`)
   const xml = await res.text()
   if (!xml.includes('<TimeSeries')) {
     if (/No matching data/i.test(xml)) return [] // not published yet

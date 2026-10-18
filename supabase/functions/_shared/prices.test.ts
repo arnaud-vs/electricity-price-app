@@ -1,6 +1,6 @@
 // Run: node supabase/functions/_shared/prices.test.ts
 import assert from 'node:assert'
-import { dayBounds, parseA44 } from './prices.ts'
+import { dayBounds, parseA44, parseTennet } from './prices.ts'
 
 // Normal, short (spring forward) and long (fall back) Brussels days.
 assert.deepEqual(dayBounds('2026-10-12').map(d => d.toISOString()), ['2026-10-11T22:00:00.000Z', '2026-10-12T22:00:00.000Z'])
@@ -18,4 +18,17 @@ const xml = `<Publication_MarketDocument><TimeSeries><Period>
 const [from, to] = dayBounds('2026-10-12')
 assert.deepEqual(parseA44(xml, from, to).map(x => x.p), [50.5, 50.5, -10, 70])
 assert.deepEqual(parseA44(xml, new Date('2026-10-11T22:30Z'), to).map(x => x.p), [-10, 70])
+// TenneT: second price only in regulation state 2, missing prices and other days dropped, sorted.
+const pt = (t: string, shortage: string | null, surplus: string | null, regulation_state: number) =>
+  ({ timeInterval_start: t, shortage, surplus, regulation_state })
+const tennet = { Response: { TimeSeries: [{ Period: { Points: [
+  pt('2026-10-12T08:15:00Z', '120.50', '-30.00', 2),
+  pt('2026-10-12T08:00:00Z', '80.00', '80.00', 1),
+  pt('2026-10-12T08:30:00Z', null, null, 0),
+  pt('2026-10-12T22:00:00Z', '50.00', '50.00', -1),
+] } }] } }
+assert.deepEqual(parseTennet(tennet, from, to), [
+  { t: '2026-10-12T08:00:00.000Z', p: 80 },
+  { t: '2026-10-12T08:15:00.000Z', p: 120.5, p2: -30 },
+])
 console.log('ok')

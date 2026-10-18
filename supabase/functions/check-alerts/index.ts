@@ -1,14 +1,14 @@
-// Runs every 5 minutes from pg_cron (see migrations). Sends push notifications for:
+// Runs every 5 minutes from pg_cron (see migrations). Per zone (BE, NL), sends push notifications for:
 //  - imbalance: once when the latest quarter-hour crosses above/below a device's threshold
 //    (again only after it has returned inside the band, or crossed to the other side)
 //  - day-ahead: once, as soon as tomorrow's prices are published, if any quarter-hour is past a threshold
 // Protected by the x-cron-secret header.
 
 import { createClient } from 'npm:@supabase/supabase-js@2'
-import { brusselsDate, brusselsHour, dayAhead, hhmm, imbalance } from '../_shared/prices.ts'
+import { brusselsDate, brusselsHour, dayAhead, hhmm, imbalance, type Zone, ZONES } from '../_shared/prices.ts'
 
 type Row = {
-  token: string
+  token: string; zone: Zone
   da_above: number | null; da_below: number | null
   imb_above: number | null; imb_below: number | null
   imb_state: 'above' | 'below' | null; da_notified_for: string | null
@@ -16,6 +16,7 @@ type Row = {
 type Msg = { to: string; title: string; body: string; sound: 'default' }
 
 const eur = (p: number) => `€${Math.round(p)}`
+const NAMES: Record<Zone, string> = { BE: 'Belgium', NL: 'Netherlands' }
 
 Deno.serve(async (req: Request) => {
   if (req.headers.get('x-cron-secret') !== Deno.env.get('CRON_SECRET')) return new Response('unauthorized', { status: 401 })
@@ -24,38 +25,47 @@ Deno.serve(async (req: Request) => {
   if (error) { console.error(error); return new Response('db error', { status: 500 }) }
   const rows = data as Row[]
   const msgs: Msg[] = []
-  const updates: [string, Partial<Row>][] = []
-
-  // Imbalance: latest published quarter-hour of today.
-  const latest = (await imbalance(brusselsDate()).catch(e => (console.error(e), []))).at(-1)
-  if (latest) for (const r of rows) {
-    const state = r.imb_above != null && latest.p > r.imb_above ? 'above'
-      : r.imb_below != null && latest.p < r.imb_below ? 'below' : null
-    if (state === r.imb_state) continue
-    if (state) msgs.push({
-      to: r.token, sound: 'default',
-      title: `Imbalance price ${state} ${eur(state === 'above' ? r.imb_above! : r.imb_below!)}`,
-      body: `${eur(latest.p)}/MWh for the ${hhmm(latest.t)} quarter-hour`,
-    })
-    updates.push([r.token, { imb_state: state }])
-  }
-
-  // Day-ahead: tomorrow's prices, published around 13:00 Brussels time.
+  const updates: [Row, Partial<Row>][] = []
   const tomorrow = brusselsDate(1)
-  const pending = rows.filter(r => r.da_notified_for !== tomorrow && (r.da_above != null || r.da_below != null))
-  if (pending.length && brusselsHour() >= 12) {
-    const da = await dayAhead(tomorrow, Deno.env.get('ENTSOE_TOKEN')!).catch(e => (console.error(e), []))
-    if (da.length >= 92) { // full day published (92/96/100 quarter-hours depending on DST)
-      const max = da.reduce((a, b) => (b.p > a.p ? b : a)), min = da.reduce((a, b) => (b.p < a.p ? b : a))
-      for (const r of pending) {
-        const lines = []
-        if (r.da_above != null && max.p > r.da_above)
-          lines.push(`${da.filter(x => x.p > r.da_above!).length} quarter-hours above ${eur(r.da_above)}, peak ${eur(max.p)} at ${hhmm(max.t)}`)
-        if (r.da_below != null && min.p < r.da_below)
-          lines.push(`${da.filter(x => x.p < r.da_below!).length} quarter-hours below ${eur(r.da_below)}, low ${eur(min.p)} at ${hhmm(min.t)}`)
-        if (lines.length) msgs.push({ to: r.token, sound: 'default', title: "Tomorrow's day-ahead prices", body: lines.join('\n') })
-        updates.push([r.token, { da_notified_for: tomorrow }])
+
+  for (const zone of ZONES) {
+    const zrows = rows.filter(r => r.zone === zone)
+    if (!zrows.length) continue
+    const name = NAMES[zone]
+
+    // Imbalance: latest published quarter-hour of today. In NL regulation state 2 there are two
+    // prices; "above" checks the higher one and "below" the lower one.
+    const latest = (await imbalance(brusselsDate(), zone).catch(e => (console.error(e), []))).at(-1)
+    if (latest) {
+      const high = Math.max(latest.p, latest.p2 ?? latest.p), low = Math.min(latest.p, latest.p2 ?? latest.p)
+      const dual = latest.p2 != null ? ` (dual pricing: shortage ${eur(latest.p)}, surplus ${eur(latest.p2)})` : ''
+      for (const r of zrows) {
+        const state = r.imb_above != null && high > r.imb_above ? 'above'
+          : r.imb_below != null && low < r.imb_below ? 'below' : null
+        if (state === r.imb_state) continue
+        if (state) msgs.push({
+          to: r.token, sound: 'default',
+          title: `${name} imbalance price ${state} ${eur(state === 'above' ? r.imb_above! : r.imb_below!)}`,
+          body: `${eur(state === 'above' ? high : low)}/MWh for the ${hhmm(latest.t)} quarter-hour${dual}`,
+        })
+        updates.push([r, { imb_state: state }])
       }
+    }
+
+    // Day-ahead: tomorrow's prices, published around 13:00 CET.
+    const pending = zrows.filter(r => r.da_notified_for !== tomorrow && (r.da_above != null || r.da_below != null))
+    if (!pending.length || brusselsHour() < 12) continue
+    const da = await dayAhead(tomorrow, zone, Deno.env.get('ENTSOE_TOKEN')!).catch(e => (console.error(e), []))
+    if (da.length < 92) continue // full day not published yet (92/96/100 quarter-hours depending on DST)
+    const max = da.reduce((a, b) => (b.p > a.p ? b : a)), min = da.reduce((a, b) => (b.p < a.p ? b : a))
+    for (const r of pending) {
+      const lines = []
+      if (r.da_above != null && max.p > r.da_above)
+        lines.push(`${da.filter(x => x.p > r.da_above!).length} quarter-hours above ${eur(r.da_above)}, peak ${eur(max.p)} at ${hhmm(max.t)}`)
+      if (r.da_below != null && min.p < r.da_below)
+        lines.push(`${da.filter(x => x.p < r.da_below!).length} quarter-hours below ${eur(r.da_below)}, low ${eur(min.p)} at ${hhmm(min.t)}`)
+      if (lines.length) msgs.push({ to: r.token, sound: 'default', title: `${name}: tomorrow's day-ahead prices`, body: lines.join('\n') })
+      updates.push([r, { da_notified_for: tomorrow }])
     }
   }
 
@@ -74,7 +84,7 @@ Deno.serve(async (req: Request) => {
   }
 
   // ponytail: one UPDATE per changed device; batch it if the user count gets large.
-  for (const [token, patch] of updates) await db.from('alerts').update(patch).eq('token', token)
+  for (const [r, patch] of updates) await db.from('alerts').update(patch).eq('token', r.token).eq('zone', r.zone)
   if (dead.length) await db.from('alerts').delete().in('token', dead) // app uninstalled
 
   return Response.json({ sent: msgs.length, removed: dead.length })

@@ -1,8 +1,8 @@
-# Privacy Policy — BE Power Prices
+# Privacy Policy — Power Prices
 
 **Effective date:** 12 October 2026
 
-BE Power Prices ("the app") shows Belgian electricity prices and can send you price alerts. It is operated by Arnaud Verstraeten ("the developer").
+Power Prices ("the app") shows Belgian and Dutch electricity prices and can send you price alerts. It is operated by Arnaud Verstraeten ("the developer").
 
 ## Summary
 

@@ -62,8 +62,8 @@ Deno.serve(async (req: Request) => {
         if (state === r.imb_state) continue
         if (state) msgs.push({
           to: r.token, sound: 'default',
-          title: `${name} imbalance price ${state} ${eur(state === 'above' ? r.imb_above! : r.imb_below!)}`,
-          body: `${eur(state === 'above' ? high : low)}/MWh for the ${hhmm(latest.t)} quarter-hour${dual}`,
+          title: `${state === 'above' ? 'High' : 'Low'} imbalance price in ${name}!`,
+          body: `${eur(state === 'above' ? high : low)}/MWh between ${hhmm(latest.t)}-${hhmm(new Date(Date.parse(latest.t) + 15 * 60e3).toISOString())}${dual}`,
         })
         updates.push([r, { imb_state: state }])
       }

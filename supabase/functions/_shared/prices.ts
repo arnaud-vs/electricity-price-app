@@ -63,21 +63,35 @@ type TennetPoint = { timeInterval_start: string; shortage: string | null; surplu
 
 async function tennet(date: string): Promise<Point[]> {
   const [from, to] = dayBounds(date)
-  // The API takes "DD-MM-YYYY HH:MM:SS" without a zone; ask a day either side and filter on the UTC timestamps.
-  const fmt = (d: Date) => d.toISOString().replace(/^(\d+)-(\d+)-(\d+)T.*/, '$3-$2-$1 00:00:00')
+  // The API takes "DD-MM-YYYY HH:MM:SS" without saying which zone, and seems to return at most 200 points.
+  // Previous day 22:00 to next day 00:00 covers the local day whether it reads that as UTC or local
+  // time (at most 104 points); the UTC filter in parseTennet keeps exactly the day.
+  const fmt = (d: string, plusDays: number, time: string) =>
+    new Date(Date.parse(d) + plusDays * 864e5).toISOString().replace(/^(\d+)-(\d+)-(\d+)T.*/, `$3-$2-$1 ${time}`)
   const res = await fetch('https://api.tennet.eu/publications/v1/settlement-prices'
-    + `?date_from=${encodeURIComponent(fmt(new Date(+from - 864e5)))}&date_to=${encodeURIComponent(fmt(new Date(+to + 864e5)))}`,
+    + `?date_from=${encodeURIComponent(fmt(date, -1, '22:00:00'))}&date_to=${encodeURIComponent(fmt(date, 1, '00:00:00'))}`,
     { headers: { apikey: Deno.env.get('TENNET_API_KEY')!, Accept: 'application/json' } })
   if (res.status === 404) return [] // "No data found"
   if (!res.ok) throw new Error(`TenneT ${res.status}: ${(await res.text()).slice(0, 300)}`)
   return parseTennet(await res.json(), from, to)
 }
 
-export function parseTennet(json: { Response: { TimeSeries: { Period: { Points: TennetPoint[] } }[] } }, from: Date, to: Date): Point[] {
-  return json.Response.TimeSeries.flatMap(s => s.Period.Points)
-    .filter(x => x.shortage != null && +new Date(x.timeInterval_start) >= +from && +new Date(x.timeInterval_start) < +to)
+// Local wall-clock time without zone ("2026-10-17T22:00") → UTC instant.
+function fromLocal(s: string): number {
+  const guess = Date.parse(s + 'Z')
+  const m = new Intl.DateTimeFormat('en', { timeZone: TZ, timeZoneName: 'longOffset' })
+    .format(guess).match(/GMT([+-])(\d\d):(\d\d)/)
+  return guess - (m ? (m[1] === '-' ? -1 : 1) * (+m[2] * 60 + +m[3]) : 0) * 60e3
+}
+
+// Settlement prices only cover finished days: for today TenneT answers 200 { error: "No data found" }.
+// Timestamps are Dutch local time without a zone.
+export function parseTennet(json: { error?: string; Response?: { TimeSeries: { Period: { Points: TennetPoint[] } }[] } }, from: Date, to: Date): Point[] {
+  return (json.Response?.TimeSeries ?? []).flatMap(s => s.Period.Points)
+    .map(x => ({ ...x, at: fromLocal(x.timeInterval_start) }))
+    .filter(x => x.shortage != null && x.at >= +from && x.at < +to)
     .map(x => ({
-      t: new Date(x.timeInterval_start).toISOString(), p: +x.shortage!,
+      t: new Date(x.at).toISOString(), p: +x.shortage!,
       ...(x.regulation_state === 2 && x.surplus != null ? { p2: +x.surplus } : {}),
     }))
     .sort((a, b) => a.t.localeCompare(b.t))

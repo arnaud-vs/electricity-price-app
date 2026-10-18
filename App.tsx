@@ -4,7 +4,7 @@ import * as Notifications from 'expo-notifications'
 import Storage from 'expo-sqlite/kv-store'
 import { StatusBar } from 'expo-status-bar'
 import { useCallback, useEffect, useState } from 'react'
-import { Alert, AppState, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native'
+import { Alert, AppState, Linking, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native'
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context'
 
 // Supabase edge functions base URL. Public, not a secret.
@@ -18,6 +18,7 @@ type Zone = (typeof ZONES)[number][0]
 // NL imbalance in regulation state 2 has two prices: p is the shortage price, p2 the surplus price.
 type Point = { t: string; p: number; p2?: number }
 type Prices = { from: string; to: string; da: Point[] | null; imb: Point[] | null }
+const FEEDBACK = 'arnaud@gridual.ai'
 const DA = '#2563eb', IMB = '#ea580c', SURPLUS = '#16a34a'
 const FIELDS = [
   ['da_above', 'Day-ahead above'], ['da_below', 'Day-ahead below'],
@@ -53,6 +54,7 @@ function Home() {
   const [refreshing, setRefreshing] = useState(false)
   const [fields, setFields] = useState(EMPTY)
   const [saving, setSaving] = useState(false)
+  const [idea, setIdea] = useState('')
   const name = ZONES.find(z => z[0] === zone)![1]
 
   const load = useCallback(async () => {
@@ -112,6 +114,18 @@ function Home() {
     }
   }
 
+  // ponytail: opens the Mail app instead of a backend mailer; add an edge function + email API if
+  // people without Mail set up need to send ideas.
+  async function sendIdea() {
+    const url = `mailto:${FEEDBACK}?subject=${encodeURIComponent('Power Prices idea')}&body=${encodeURIComponent(idea)}`
+    try {
+      await Linking.openURL(url)
+      setIdea('')
+    } catch {
+      Alert.alert('No mail app', `Send your idea to ${FEEDBACK}`)
+    }
+  }
+
   async function refresh() {
     setRefreshing(true)
     await load()
@@ -157,6 +171,14 @@ function Home() {
         ))}
         <Pressable style={[s.button, saving && { opacity: 0.5 }]} onPress={save} disabled={saving} accessibilityRole="button">
           <Text style={s.buttonText}>Save alerts</Text>
+        </Pressable>
+
+        <Text style={[s.h2, { marginTop: 32 }]}>Ideas box</Text>
+        <Text style={s.muted}>Missing a country, a price or a feature? Tell me.</Text>
+        <TextInput style={[s.input, s.idea]} value={idea} onChangeText={setIdea} multiline placeholder="Your idea"
+          accessibilityLabel="Your idea" />
+        <Pressable style={[s.button, !idea.trim() && { opacity: 0.5 }]} onPress={sendIdea} disabled={!idea.trim()} accessibilityRole="button">
+          <Text style={s.buttonText}>Send idea</Text>
         </Pressable>
       </ScrollView>
     </SafeAreaView>
@@ -276,6 +298,7 @@ const s = StyleSheet.create({
   sign: { width: 36, height: 36, borderRadius: 8, backgroundColor: '#e7e5e4', alignItems: 'center', justifyContent: 'center' },
   signText: { fontSize: 18, color: '#111' },
   input: { backgroundColor: '#fff', borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8, width: 120, fontSize: 16, textAlign: 'right' },
+  idea: { width: '100%', minHeight: 96, marginTop: 12, textAlign: 'left', textAlignVertical: 'top' },
   button: { backgroundColor: '#111', borderRadius: 10, paddingVertical: 14, alignItems: 'center', marginTop: 20 },
   buttonText: { color: '#fff', fontSize: 16, fontWeight: '600' },
 })

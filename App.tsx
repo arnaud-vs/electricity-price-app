@@ -4,7 +4,7 @@ import * as Notifications from 'expo-notifications'
 import Storage from 'expo-sqlite/kv-store'
 import { StatusBar } from 'expo-status-bar'
 import { useCallback, useEffect, useState } from 'react'
-import { Alert, AppState, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native'
+import { Alert, AppState, type GestureResponderEvent, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native'
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context'
 
 // Supabase edge functions base URL. Public, not a secret.
@@ -17,7 +17,8 @@ const ZONES = [['BE', 'Belgium'], ['NL', 'Netherlands']] as const
 type Zone = (typeof ZONES)[number][0]
 // NL imbalance in regulation state 2 has two prices: p is the shortage price, p2 the surplus price.
 type Point = { t: string; p: number; p2?: number }
-type Prices = { from: string; to: string; da: Point[] | null; imb: Point[] | null }
+type Day = { from: string; to: string; da: Point[] | null }
+type Prices = Day & { imb: Point[] | null; tomorrow?: Day }
 const DA = '#2563eb', IMB = '#ea580c', SURPLUS = '#16a34a'
 const FIELDS = [
   ['da_above', 'Day-ahead above'], ['da_below', 'Day-ahead below'],
@@ -153,6 +154,7 @@ function Home() {
         </View>
         {error && <Text style={s.error}>Could not load prices. Pull down to retry.</Text>}
         {prices && <PriceCard prices={prices} />}
+        {prices?.tomorrow?.da?.length ? <TomorrowCard day={prices.tomorrow} /> : null}
 
         <Text style={[s.h2, { marginTop: 24 }]}>Alerts for {name}</Text>
         <Text style={s.muted}>
@@ -222,6 +224,18 @@ function PriceCard({ prices: { da, imb, from, to } }: { prices: Prices }) {
   )
 }
 
+function TomorrowCard({ day: { da, from, to } }: { day: Day }) {
+  const ps = da!.map(x => x.p)
+  return (
+    <View style={s.card}>
+      <Text style={s.h2}>Tomorrow</Text>
+      <Text style={s.muted}>Day-ahead low €{Math.round(Math.min(...ps))} · high €{Math.round(Math.max(...ps))}</Text>
+      <Chart series={[{ color: DA, label: 'Day-ahead', points: da! }]} from={from} to={to} />
+      <Text style={s.muted}>€/MWh per quarter-hour, tomorrow</Text>
+    </View>
+  )
+}
+
 function Headline({ label, color, value, note, missing }: { label: string; color: string; value?: number; note?: string; missing: string }) {
   return (
     <View>
@@ -236,20 +250,35 @@ function Headline({ label, color, value, note, missing }: { label: string; color
 type Series = { color: string; label: string; points: Point[] }
 
 // Step lines from plain Views: one horizontal segment per quarter-hour, one riser between neighbours.
+// Touch and drag on the chart to read the prices of one quarter-hour.
 function Chart({ series, from, to }: { series: Series[]; from: string; to: string }) {
+  const [width, setWidth] = useState(1)
+  const [sel, setSel] = useState<number | null>(null)
   const start = +new Date(from)
   const n = Math.round((+new Date(to) - start) / QH) // 92, 96 or 100 quarter-hours
   const all = series.flatMap(x => x.points.map(pt => pt.p))
   const max = Math.max(0, ...all), min = Math.min(0, ...all)
   const y = (p: number) => ((max - p) / (max - min || 1)) * H // px from the top
   const pct = (i: number) => `${(i / n) * 100}%` as const
+  const slots = series.map(x => new Map(x.points.map(pt => [Math.round((+new Date(pt.t) - start) / QH), pt.p])))
+  const touch = (e: GestureResponderEvent) => setSel(Math.max(0, Math.min(n - 1, Math.floor((e.nativeEvent.locationX / width) * n))))
   const ticks = Array.from({ length: n }, (_, i) => i).filter(i => ['00:00', '06:00', '12:00', '18:00'].includes(hhmm(start + i * QH)))
   return (
     <View>
-      <View style={{ height: H, marginTop: 8 }}>
+      <View style={s.readout}>
+        {sel == null
+          ? <Text style={s.muted}>Touch the chart for prices</Text>
+          : <Text style={s.readoutText}>
+              <Text style={{ fontWeight: '600' }}>{hhmm(start + sel * QH)}</Text>
+              {series.map((x, k) => (
+                <Text key={x.label}>{'  '}<Text style={{ color: x.color }}>●</Text> {slots[k].has(sel) ? `€${Math.round(slots[k].get(sel)!)}` : '–'}</Text>
+              ))}
+            </Text>}
+      </View>
+      <View style={{ height: H }} onLayout={e => setWidth(e.nativeEvent.layout.width)}>
         <View style={[s.zero, { top: y(0) }]} />
-        {series.map(({ color, points }) => {
-          const byslot = new Map(points.map(x => [Math.round((+new Date(x.t) - start) / QH), x.p]))
+        {series.map(({ color }, k) => {
+          const byslot = slots[k]
           return [...byslot].map(([i, p]) => {
             const next = byslot.get(i + 1)
             return [
@@ -261,6 +290,11 @@ function Chart({ series, from, to }: { series: Series[]; from: string; to: strin
             ]
           })
         })}
+        {sel != null && <View style={[s.cursor, { left: pct(sel + 0.5) }]} />}
+        {/* Transparent layer on top, so locationX is always relative to the whole chart. */}
+        <View style={StyleSheet.absoluteFill} onStartShouldSetResponder={() => true} onMoveShouldSetResponder={() => true}
+          onResponderTerminationRequest={() => false} onResponderGrant={touch} onResponderMove={touch}
+          onResponderRelease={() => setSel(null)} onResponderTerminate={() => setSel(null)} />
       </View>
       <View style={{ height: 16 }}>
         {ticks.map(i => <Text key={i} style={[s.tick, { left: pct(i) }]}>{hhmm(start + i * QH)}</Text>)}
@@ -295,6 +329,9 @@ const s = StyleSheet.create({
   cardHead: { flexDirection: 'row', justifyContent: 'space-between' },
   zero: { position: 'absolute', left: 0, right: 0, height: StyleSheet.hairlineWidth, backgroundColor: '#999' },
   seg: { position: 'absolute', height: 2 },
+  cursor: { position: 'absolute', top: 0, bottom: 0, width: 1, backgroundColor: '#111' },
+  readout: { height: 22, justifyContent: 'center', marginTop: 8 },
+  readoutText: { fontSize: 13, color: '#111' },
   tick: { position: 'absolute', fontSize: 11, color: '#666', top: 2 },
   legend: { flexDirection: 'row', flexWrap: 'wrap', gap: 12, marginTop: 8 },
   legendItem: { flexDirection: 'row', alignItems: 'center', gap: 6 },

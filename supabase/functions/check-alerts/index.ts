@@ -18,6 +18,7 @@ type Msg = { to: string; title: string; body: string; sound: 'default' }
 
 const eur = (p: number) => `€${Math.round(p)}`
 const NAMES: Record<Zone, string> = { BE: 'Belgium', NL: 'Netherlands' }
+const span = (t: string) => `${hhmm(t)}-${hhmm(new Date(Date.parse(t) + 15 * 60e3).toISOString())}`
 
 // Merge TenneT's last 30 minutes into imbalance_nl (a quarter-hour can span several polls) and drop
 // rows older than 2 days.
@@ -63,7 +64,7 @@ Deno.serve(async (req: Request) => {
         if (state) msgs.push({
           to: r.token, sound: 'default',
           title: `${state === 'above' ? 'High' : 'Low'} imbalance price in ${name}!`,
-          body: `${eur(state === 'above' ? high : low)}/MWh between ${hhmm(latest.t)}-${hhmm(new Date(Date.parse(latest.t) + 15 * 60e3).toISOString())}${dual}`,
+          body: `${eur(state === 'above' ? high : low)}/MWh between ${span(latest.t)}${dual}`,
         })
         updates.push([r, { imb_state: state }])
       }
@@ -76,12 +77,16 @@ Deno.serve(async (req: Request) => {
     if (da.length < 92) continue // full day not published yet (92/96/100 quarter-hours depending on DST)
     const max = da.reduce((a, b) => (b.p > a.p ? b : a)), min = da.reduce((a, b) => (b.p < a.p ? b : a))
     for (const r of pending) {
-      const lines = []
-      if (r.da_above != null && max.p > r.da_above)
-        lines.push(`${da.filter(x => x.p > r.da_above!).length} quarter-hours above ${eur(r.da_above)}, peak ${eur(max.p)} at ${hhmm(max.t)}`)
-      if (r.da_below != null && min.p < r.da_below)
-        lines.push(`${da.filter(x => x.p < r.da_below!).length} quarter-hours below ${eur(r.da_below)}, low ${eur(min.p)} at ${hhmm(min.t)}`)
-      if (lines.length) msgs.push({ to: r.token, sound: 'default', title: `${name}: tomorrow's day-ahead prices`, body: lines.join('\n') })
+      const kinds = [], lines = []
+      if (r.da_above != null && max.p > r.da_above) {
+        kinds.push('High')
+        lines.push(`Peak ${eur(max.p)}/MWh between ${span(max.t)} (${da.filter(x => x.p > r.da_above!).length} quarter-hours above ${eur(r.da_above)})`)
+      }
+      if (r.da_below != null && min.p < r.da_below) {
+        kinds.push(kinds.length ? 'low' : 'Low')
+        lines.push(`Low ${eur(min.p)}/MWh between ${span(min.t)} (${da.filter(x => x.p < r.da_below!).length} quarter-hours below ${eur(r.da_below)})`)
+      }
+      if (lines.length) msgs.push({ to: r.token, sound: 'default', title: `${kinds.join(' and ')} day-ahead prices in ${name} tomorrow!`, body: lines.join('\n') })
       updates.push([r, { da_notified_for: tomorrow }])
     }
   }
